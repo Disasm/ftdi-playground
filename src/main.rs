@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::convert::TryInto;
 
 mod ftdi;
 
@@ -70,10 +71,61 @@ impl FtdiProbe {
 
             let last_bit = (byte >> (bits - 1)) & 0x01;
             let tms_byte = 0x01 | (last_bit << 7);
-            command.extend_from_slice(&[0x4b, 0x00, tms_byte]);
+            command.extend_from_slice(&[0x4a, 0x00, tms_byte]);
         }
 
         self.device.write_all(&command)
+    }
+
+    fn tranfer_tdi(&mut self, mut data: &[u8], mut bits: usize) -> io::Result<Vec<u8>> {
+        assert!(bits > 0);
+        assert!((bits + 7) / 8 <= data.len());
+
+        let mut command = vec![];
+
+        let full_bytes = (bits - 1) / 8;
+        if full_bytes > 0 {
+            assert!(full_bytes <= 65536);
+
+            command.extend_from_slice(&[0x3c]);
+            let n: u16 = (full_bytes - 1) as u16;
+            command.extend_from_slice(&n.to_le_bytes());
+            command.extend_from_slice(&data[..full_bytes]);
+
+            bits -= full_bytes * 8;
+            data = &data[full_bytes..];
+        }
+        assert!(0 < bits && bits <= 8);
+
+        let byte = data[0];
+        if bits > 1 {
+            let n = (bits - 2) as u8;
+            command.extend_from_slice(&[0x3e, n, byte]);
+        }
+
+        let last_bit = (byte >> (bits - 1)) & 0x01;
+        let tms_byte = 0x01 | (last_bit << 7);
+        command.extend_from_slice(&[0x6b, 0x00, tms_byte]);
+
+        self.device.write_all(&command)?;
+
+        let mut expect_bytes = full_bytes + 1;
+        if bits > 1 {
+            expect_bytes += 1;
+        }
+        let mut reply = vec![];
+        reply.resize(expect_bytes, 0);
+        self.device.read_exact(&mut reply)?;
+
+        let mut last_byte = reply[reply.len() - 1] & 0x01;
+        if bits > 1 {
+            let byte = reply[reply.len() - 2];
+            last_byte = byte | (last_byte << (bits - 1));
+        }
+        reply[full_bytes + 1] = last_byte;
+        reply.truncate(full_bytes + 1);
+
+        Ok(reply)
     }
 
     /// Reset and go to RUN-TEST/IDLE
@@ -96,12 +148,72 @@ impl FtdiProbe {
         Ok(())
     }
 
+    /// Shift to IR and return to IDLE
+    pub fn transfer_ir(&mut self, data: &[u8], bits: usize) -> io::Result<Vec<u8>> {
+        self.shift_tms(&[0b0011], 4)?;
+        let r = self.tranfer_tdi(data, bits)?;
+        self.shift_tms(&[0b01], 2)?;
+        Ok(r)
+    }
+
     /// Shift to DR and return to IDLE
     pub fn shift_dr(&mut self, data: &[u8], bits: usize) -> io::Result<()> {
         self.shift_tms(&[0b001], 3)?;
         self.shift_tdi(data, bits)?;
         self.shift_tms(&[0b01], 2)?;
         Ok(())
+    }
+
+    /// Shift to DR and return to IDLE
+    pub fn transfer_dr(&mut self, data: &[u8], bits: usize) -> io::Result<Vec<u8>> {
+        self.shift_tms(&[0b001], 3)?;
+        let r = self.tranfer_tdi(data, bits)?;
+        self.shift_tms(&[0b01], 2)?;
+        Ok(r)
+    }
+}
+
+fn scan_chain(probe: &mut FtdiProbe) {
+    let max_device_count = 8;
+
+    probe.reset().unwrap();
+
+    let cmd = vec![0xff; max_device_count*4];
+    let r = probe.transfer_dr(&cmd, cmd.len()*8).unwrap();
+    let mut n = 0;
+    for i in 0..max_device_count {
+        let idcode = u32::from_le_bytes(r[i*4..(i+1)*4].try_into().unwrap());
+        if idcode != 0xffffffff {
+            println!("Device found: {:08x}", idcode);
+            n += 1;
+        } else {
+            break;
+        }
+    }
+
+    probe.reset().unwrap();
+    let cmd = vec![0xff; max_device_count];
+    let mut r = probe.transfer_ir(&cmd, cmd.len()*8).unwrap();
+
+    let mut ir = 0;
+    let mut irbits = 0;
+    for i in 0..n {
+        if r.len() > 0 && irbits < 8 {
+            let byte = r[0];
+            r.remove(0);
+            ir |= (byte as u32) << irbits;
+            irbits += 8;
+        }
+        if ir & 0b11 == 0b01 {
+            ir &= !1;
+            let irlen = ir.trailing_zeros();
+            ir = ir >> irlen;
+            irbits -= irlen;
+            println!("dev {} irlen: {}", i, irlen);
+        } else {
+            println!("invalid irlen for device {}", i);
+            break;
+        }
     }
 }
 
@@ -119,5 +231,5 @@ fn main() {
     probe.reset().unwrap();
     probe.shift_ir(&[0x10], 5).unwrap();
     probe.idle(42);
-    probe.shift_dr(&[0xff;5], 40).unwrap();
+    scan_chain(&mut probe);
 }
