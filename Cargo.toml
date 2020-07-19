@@ -5,4 +5,5 @@ authors = ["disasm"]
 edition = "2018"
 
 [dependencies]
-ftdi = "0.0.2"
+libftdi1-sys = { version = "1.0.0-alpha3", features = ["vendored"] }
+thiserror = "1.0.20"
