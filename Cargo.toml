@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 libftdi1-sys = { version = "1.0.0-alpha3", features = ["vendored"] }
 thiserror = "1.0.20"
+bitvec = "0.17.4"

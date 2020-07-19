@@ -1,5 +1,7 @@
 use std::io::{self, Read, Write};
 use std::convert::TryInto;
+use bitvec::vec::BitVec;
+use bitvec::order::Lsb0;
 
 mod ftdi;
 
@@ -8,7 +10,7 @@ struct JtagChainItem {
     irlen: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ChainParams {
     irpre: usize,
     irpost: usize,
@@ -20,6 +22,7 @@ struct ChainParams {
 struct FtdiProbe {
     device: ftdi::Device,
     chain_params: Option<ChainParams>,
+    idle_cycles: u8,
 }
 
 impl FtdiProbe {
@@ -33,9 +36,13 @@ impl FtdiProbe {
         device.set_latency_timer(2)?;
         device.set_bitmode(0x0b, ftdi::BitMode::Mpsse).unwrap();
 
+        let mut junk = vec![];
+        let _ = device.read_to_end(&mut junk);
+
         Ok(Self {
             device,
-            chain_params: None
+            chain_params: None,
+            idle_cycles: 0
         })
     }
 
@@ -68,7 +75,7 @@ impl FtdiProbe {
         if full_bytes > 0 {
             assert!(full_bytes <= 65536);
 
-            command.extend_from_slice(&[0x18]);
+            command.extend_from_slice(&[0x19]);
             let n: u16 = (full_bytes - 1) as u16;
             command.extend_from_slice(&n.to_le_bytes());
             command.extend_from_slice(&data[..full_bytes]);
@@ -82,12 +89,12 @@ impl FtdiProbe {
             let byte = data[0];
             if bits > 1 {
                 let n = (bits - 2) as u8;
-                command.extend_from_slice(&[0x1a, n, byte]);
+                command.extend_from_slice(&[0x1b, n, byte]);
             }
 
             let last_bit = (byte >> (bits - 1)) & 0x01;
             let tms_byte = 0x01 | (last_bit << 7);
-            command.extend_from_slice(&[0x4a, 0x00, tms_byte]);
+            command.extend_from_slice(&[0x4b, 0x00, tms_byte]);
         }
 
         self.device.write_all(&command)
@@ -103,7 +110,7 @@ impl FtdiProbe {
         if full_bytes > 0 {
             assert!(full_bytes <= 65536);
 
-            command.extend_from_slice(&[0x3c]);
+            command.extend_from_slice(&[0x39]);
             let n: u16 = (full_bytes - 1) as u16;
             command.extend_from_slice(&n.to_le_bytes());
             command.extend_from_slice(&data[..full_bytes]);
@@ -116,7 +123,7 @@ impl FtdiProbe {
         let byte = data[0];
         if bits > 1 {
             let n = (bits - 2) as u8;
-            command.extend_from_slice(&[0x3e, n, byte]);
+            command.extend_from_slice(&[0x3b, n, byte]);
         }
 
         let last_bit = (byte >> (bits - 1)) & 0x01;
@@ -138,7 +145,7 @@ impl FtdiProbe {
             let byte = reply[reply.len() - 2];
             last_byte = byte | (last_byte << (bits - 1));
         }
-        reply[full_bytes + 1] = last_byte;
+        reply[full_bytes] = last_byte;
         reply.truncate(full_bytes + 1);
 
         Ok(reply)
@@ -151,6 +158,9 @@ impl FtdiProbe {
 
     /// Execute RUN-TEST/IDLE for a number of cycles
     pub fn idle(&mut self, cycles: usize) -> io::Result<()> {
+        if cycles == 0 {
+            return Ok(());
+        }
         let mut buf = vec![];
         buf.resize((cycles + 7) / 8, 0);
         self.shift_tms(&buf, cycles)
@@ -274,6 +284,93 @@ impl FtdiProbe {
             Err(io::Error::new(io::ErrorKind::NotFound, "target not found"))
         }
     }
+
+    fn get_chain_params(&self) -> io::Result<ChainParams> {
+        match &self.chain_params {
+            Some(params) => Ok(params.clone()),
+            None => {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "target is not selected"
+                ))
+            }
+        }
+    }
+
+    fn target_transfer(&mut self, address: u32, data: Option<&[u8]>, len_bits: usize) -> io::Result<Vec<u8>> {
+        let params = self.get_chain_params()?;
+        let max_address = (1 << params.irlen) - 1;
+        if address > max_address {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid register address"
+            ));
+        }
+
+        // Write IR register
+        let irbits = params.irpre + params.irlen + params.irpost;
+        assert!(irbits <= 32);
+        let mut ir: u32 = (1 << params.irpre) - 1;
+        ir |= address << params.irpre;
+        ir |= ((1 << params.irpost) - 1) << (params.irpre + params.irlen);
+        self.shift_ir(&ir.to_le_bytes(), irbits)?;
+
+        let drbits = params.drpre + len_bits + params.drpost;
+        let request = if let Some(data) = data {
+            let mut data = BitVec::<Lsb0, u8>::from_slice(data);
+            data.truncate(len_bits);
+
+            let mut buf = BitVec::<Lsb0, u8>::new();
+            buf.resize(params.drpre, false);
+            buf.append(&mut data);
+            buf.resize(buf.len() + params.drpost, false);
+
+            buf.into_vec()
+        } else {
+            vec![0; (drbits + 7) / 8]
+        };
+        let mut reply = self.transfer_dr(&request, drbits)?;
+
+        // Process the reply
+        let mut reply = BitVec::<Lsb0, u8>::from_vec(reply);
+        if params.drpre > 0 {
+            reply = reply.split_off(params.drpre);
+        }
+        reply.truncate(len_bits);
+        let reply = reply.into_vec();
+
+        // Idle cycles
+        self.idle(self.idle_cycles as usize)?;
+
+        Ok(reply)
+    }
+
+    fn read_register(&mut self, address: u32, len: u32) -> io::Result<Vec<u8>> {
+        self.target_transfer(address, None, len as usize)
+    }
+
+    fn read_register32(&mut self, address: u32) -> io::Result<u32> {
+        let r = self.read_register(address, 32)?;
+        Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
+    }
+
+    fn write_register(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        len: u32,
+    ) -> io::Result<Vec<u8>> {
+        self.target_transfer(address, Some(data), len as usize)
+    }
+
+    fn write_register32(&mut self, address: u32, value: u32) -> io::Result<u32> {
+        let r = self.write_register(address, &value.to_le_bytes(), 32)?;
+        Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
+    }
+
+    fn set_idle_cycles(&mut self, idle_cycles: u8) {
+        self.idle_cycles = idle_cycles;
+    }
 }
 
 fn main() {
@@ -290,5 +387,18 @@ fn main() {
     probe.reset().unwrap();
     probe.shift_ir(&[0x10], 5).unwrap();
     probe.idle(42);
-    probe.select_target(0x790007a3).unwrap();
+    //probe.shift_ir(&[0x1f, 0x02], 10).unwrap();
+    probe.select_target(0x1000563d).unwrap();
+    probe.set_idle_cycles(8);
+
+    let r = probe.read_register32(0x01).unwrap();
+    println!("idcode: {:08x}", r);
+
+    let r = probe.read_register32(0x10).unwrap();
+    println!("dtmcs: {:08x}", r);
+    let r = probe.read_register32(0x11).unwrap();
+    println!("dmi: {:08x}", r);
+    probe.write_register32(0x10, 0b11 << 16).unwrap();
+    let r = probe.read_register32(0x10).unwrap();
+    println!("dtmcs: {:08x}", r);
 }
