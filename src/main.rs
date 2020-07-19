@@ -3,8 +3,23 @@ use std::convert::TryInto;
 
 mod ftdi;
 
+struct JtagChainItem {
+    idcode: u32,
+    irlen: usize,
+}
+
+#[derive(Debug)]
+struct ChainParams {
+    irpre: usize,
+    irpost: usize,
+    drpre: usize,
+    drpost: usize,
+    irlen: usize,
+}
+
 struct FtdiProbe {
     device: ftdi::Device,
+    chain_params: Option<ChainParams>,
 }
 
 impl FtdiProbe {
@@ -19,7 +34,8 @@ impl FtdiProbe {
         device.set_bitmode(0x0b, ftdi::BitMode::Mpsse).unwrap();
 
         Ok(Self {
-            device
+            device,
+            chain_params: None
         })
     }
 
@@ -171,48 +187,91 @@ impl FtdiProbe {
         self.shift_tms(&[0b01], 2)?;
         Ok(r)
     }
-}
 
-fn scan_chain(probe: &mut FtdiProbe) {
-    let max_device_count = 8;
+    fn scan(&mut self) -> io::Result<Vec<JtagChainItem>> {
+        let max_device_count = 8;
 
-    probe.reset().unwrap();
+        self.reset()?;
 
-    let cmd = vec![0xff; max_device_count*4];
-    let r = probe.transfer_dr(&cmd, cmd.len()*8).unwrap();
-    let mut n = 0;
-    for i in 0..max_device_count {
-        let idcode = u32::from_le_bytes(r[i*4..(i+1)*4].try_into().unwrap());
-        if idcode != 0xffffffff {
-            println!("Device found: {:08x}", idcode);
-            n += 1;
-        } else {
-            break;
+        let cmd = vec![0xff; max_device_count*4];
+        let r = self.transfer_dr(&cmd, cmd.len()*8)?;
+        let mut targets = vec![];
+        for i in 0..max_device_count {
+            let idcode = u32::from_le_bytes(r[i*4..(i+1)*4].try_into().unwrap());
+            if idcode != 0xffffffff {
+                println!("Device found: {:08x}", idcode);
+                let target = JtagChainItem {
+                    idcode,
+                    irlen: 0
+                };
+                targets.push(target);
+            } else {
+                break;
+            }
         }
+
+        self.reset()?;
+        let cmd = vec![0xff; max_device_count];
+        let mut r = self.transfer_ir(&cmd, cmd.len()*8)?;
+
+        let mut ir = 0;
+        let mut irbits = 0;
+        for (i, target) in targets.iter_mut().enumerate() {
+            if r.len() > 0 && irbits < 8 {
+                let byte = r[0];
+                r.remove(0);
+                ir |= (byte as u32) << irbits;
+                irbits += 8;
+            }
+            if ir & 0b11 == 0b01 {
+                ir &= !1;
+                let irlen = ir.trailing_zeros();
+                ir = ir >> irlen;
+                irbits -= irlen;
+                println!("dev {} irlen: {}", i, irlen);
+                target.irlen = irlen as usize;
+            } else {
+                println!("invalid irlen for device {}", i);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid IR sequence during the chain scan"
+                ));
+            }
+        }
+
+        Ok(targets)
     }
 
-    probe.reset().unwrap();
-    let cmd = vec![0xff; max_device_count];
-    let mut r = probe.transfer_ir(&cmd, cmd.len()*8).unwrap();
+    pub fn select_target(&mut self, idcode: u32) -> io::Result<()> {
+        let targets = self.scan()?;
 
-    let mut ir = 0;
-    let mut irbits = 0;
-    for i in 0..n {
-        if r.len() > 0 && irbits < 8 {
-            let byte = r[0];
-            r.remove(0);
-            ir |= (byte as u32) << irbits;
-            irbits += 8;
+        let mut found = false;
+        let mut params = ChainParams {
+            irpre: 0,
+            irpost: 0,
+            drpre: 0,
+            drpost: 0,
+            irlen: 0
+        };
+        for target in targets {
+            if target.idcode == idcode {
+                params.irlen = target.irlen;
+                found = true;
+            } else if found {
+                params.irpost += target.irlen;
+                params.drpost += 1;
+            } else {
+                params.irpre += target.irlen;
+                params.drpre += 1;
+            }
         }
-        if ir & 0b11 == 0b01 {
-            ir &= !1;
-            let irlen = ir.trailing_zeros();
-            ir = ir >> irlen;
-            irbits -= irlen;
-            println!("dev {} irlen: {}", i, irlen);
+
+        if found {
+            println!("Target chain params: {:?}", params);
+            self.chain_params = Some(params);
+            Ok(())
         } else {
-            println!("invalid irlen for device {}", i);
-            break;
+            Err(io::Error::new(io::ErrorKind::NotFound, "target not found"))
         }
     }
 }
@@ -231,5 +290,5 @@ fn main() {
     probe.reset().unwrap();
     probe.shift_ir(&[0x10], 5).unwrap();
     probe.idle(42);
-    scan_chain(&mut probe);
+    probe.select_target(0x790007a3).unwrap();
 }
