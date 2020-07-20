@@ -240,7 +240,7 @@ impl FtdiProbe {
         for i in 0..max_device_count {
             let idcode = u32::from_le_bytes(r[i * 4..(i + 1) * 4].try_into().unwrap());
             if idcode != 0xffffffff {
-                println!("tap found: {:08x}", idcode);
+                log::debug!("tap found: {:08x}", idcode);
                 let target = JtagChainItem { idcode, irlen: 0 };
                 targets.push(target);
             } else {
@@ -266,10 +266,10 @@ impl FtdiProbe {
                 let irlen = ir.trailing_zeros();
                 ir = ir >> irlen;
                 irbits -= irlen;
-                println!("tap {} irlen: {}", i, irlen);
+                log::debug!("tap {} irlen: {}", i, irlen);
                 target.irlen = irlen as usize;
             } else {
-                println!("invalid irlen for tap {}", i);
+                log::debug!("invalid irlen for tap {}", i);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid IR sequence during the chain scan",
@@ -282,7 +282,6 @@ impl FtdiProbe {
 
     pub fn select_target(&mut self, idcode: u32) -> io::Result<()> {
         let taps = self.scan()?;
-        println!("JTAG chain: {:?}", taps);
 
         let mut found = false;
         let mut params = ChainParams {
@@ -306,7 +305,7 @@ impl FtdiProbe {
         }
 
         if found {
-            println!("Target chain params: {:?}", params);
+            log::debug!("Target chain params: {:?}", params);
             self.chain_params = Some(params);
             Ok(())
         } else {
@@ -401,6 +400,8 @@ impl FtdiProbe {
 }
 
 fn main() {
+    env_logger::init();
+
     println!("Opening probe...");
 
     let mut probe = match FtdiProbe::open(0x0403, 0x6010) {

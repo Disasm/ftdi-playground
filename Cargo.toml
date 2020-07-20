@@ -8,3 +8,5 @@ edition = "2018"
 libftdi1-sys = { version = "1.0.0-alpha3", features = ["vendored"] }
 thiserror = "1.0.20"
 bitvec = "0.17.4"
+log = "0.4.11"
+env_logger = "0.7.1"
