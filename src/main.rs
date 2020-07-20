@@ -1,10 +1,12 @@
-use std::io::{self, Read, Write};
-use std::convert::TryInto;
-use bitvec::vec::BitVec;
 use bitvec::order::Lsb0;
+use bitvec::vec::BitVec;
+use std::convert::TryInto;
+use std::io::{self, Read, Write};
+use std::time::Duration;
 
 mod ftdi;
 
+#[derive(Debug)]
 struct JtagChainItem {
     idcode: u32,
     irlen: usize,
@@ -29,21 +31,59 @@ impl FtdiProbe {
     pub fn open(vid: u16, pid: u16) -> Result<Self, ftdi::Error> {
         let mut builder = ftdi::Builder::new();
         builder.set_interface(ftdi::Interface::A)?;
-        let mut device = builder.usb_open(vid, pid)?;
-
-        device.usb_reset()?;
-        device.usb_purge_buffers()?;
-        device.set_latency_timer(2)?;
-        device.set_bitmode(0x0b, ftdi::BitMode::Mpsse).unwrap();
-
-        let mut junk = vec![];
-        let _ = device.read_to_end(&mut junk);
+        let device = builder.usb_open(vid, pid)?;
 
         Ok(Self {
             device,
             chain_params: None,
-            idle_cycles: 0
+            idle_cycles: 0,
         })
+    }
+
+    pub fn attach(&mut self) -> Result<(), ftdi::Error> {
+        self.device.usb_reset()?;
+        self.device.set_latency_timer(1)?;
+        self.device.set_bitmode(0x0b, ftdi::BitMode::Mpsse)?;
+        self.device.usb_purge_buffers()?;
+
+        let mut junk = vec![];
+        let _ = self.device.read_to_end(&mut junk);
+
+        // Minimal values, may not work with all probes
+        let output: u16 = 0x0008;
+        let direction: u16 = 0x000b;
+        self.device
+            .write_all(&[0x80, output as u8, direction as u8])?;
+        self.device
+            .write_all(&[0x82, (output >> 8) as u8, (direction >> 8) as u8])?;
+
+        // Disable loopback
+        self.device.write_all(&[0x85])?;
+
+        Ok(())
+    }
+
+    fn read_response(&mut self, size: usize) -> io::Result<Vec<u8>> {
+        let timeout = Duration::from_millis(10);
+        let mut result = Vec::new();
+
+        let t0 = std::time::Instant::now();
+        while result.len() < size {
+            if t0.elapsed() > timeout {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+
+            self.device.read_to_end(&mut result)?;
+        }
+
+        if result.len() > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Read more data than expected",
+            ));
+        }
+
+        Ok(result)
     }
 
     fn shift_tms(&mut self, mut data: &[u8], mut bits: usize) -> io::Result<()> {
@@ -136,9 +176,8 @@ impl FtdiProbe {
         if bits > 1 {
             expect_bytes += 1;
         }
-        let mut reply = vec![];
-        reply.resize(expect_bytes, 0);
-        self.device.read_exact(&mut reply)?;
+
+        let mut reply = self.read_response(expect_bytes)?;
 
         let mut last_byte = reply[reply.len() - 1] & 0x01;
         if bits > 1 {
@@ -183,14 +222,6 @@ impl FtdiProbe {
     }
 
     /// Shift to DR and return to IDLE
-    pub fn shift_dr(&mut self, data: &[u8], bits: usize) -> io::Result<()> {
-        self.shift_tms(&[0b001], 3)?;
-        self.shift_tdi(data, bits)?;
-        self.shift_tms(&[0b01], 2)?;
-        Ok(())
-    }
-
-    /// Shift to DR and return to IDLE
     pub fn transfer_dr(&mut self, data: &[u8], bits: usize) -> io::Result<Vec<u8>> {
         self.shift_tms(&[0b001], 3)?;
         let r = self.tranfer_tdi(data, bits)?;
@@ -203,17 +234,14 @@ impl FtdiProbe {
 
         self.reset()?;
 
-        let cmd = vec![0xff; max_device_count*4];
-        let r = self.transfer_dr(&cmd, cmd.len()*8)?;
+        let cmd = vec![0xff; max_device_count * 4];
+        let r = self.transfer_dr(&cmd, cmd.len() * 8)?;
         let mut targets = vec![];
         for i in 0..max_device_count {
-            let idcode = u32::from_le_bytes(r[i*4..(i+1)*4].try_into().unwrap());
+            let idcode = u32::from_le_bytes(r[i * 4..(i + 1) * 4].try_into().unwrap());
             if idcode != 0xffffffff {
-                println!("Device found: {:08x}", idcode);
-                let target = JtagChainItem {
-                    idcode,
-                    irlen: 0
-                };
+                println!("tap found: {:08x}", idcode);
+                let target = JtagChainItem { idcode, irlen: 0 };
                 targets.push(target);
             } else {
                 break;
@@ -222,7 +250,7 @@ impl FtdiProbe {
 
         self.reset()?;
         let cmd = vec![0xff; max_device_count];
-        let mut r = self.transfer_ir(&cmd, cmd.len()*8)?;
+        let mut r = self.transfer_ir(&cmd, cmd.len() * 8)?;
 
         let mut ir = 0;
         let mut irbits = 0;
@@ -238,13 +266,13 @@ impl FtdiProbe {
                 let irlen = ir.trailing_zeros();
                 ir = ir >> irlen;
                 irbits -= irlen;
-                println!("dev {} irlen: {}", i, irlen);
+                println!("tap {} irlen: {}", i, irlen);
                 target.irlen = irlen as usize;
             } else {
-                println!("invalid irlen for device {}", i);
+                println!("invalid irlen for tap {}", i);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Invalid IR sequence during the chain scan"
+                    "Invalid IR sequence during the chain scan",
                 ));
             }
         }
@@ -253,7 +281,8 @@ impl FtdiProbe {
     }
 
     pub fn select_target(&mut self, idcode: u32) -> io::Result<()> {
-        let targets = self.scan()?;
+        let taps = self.scan()?;
+        println!("JTAG chain: {:?}", taps);
 
         let mut found = false;
         let mut params = ChainParams {
@@ -261,17 +290,17 @@ impl FtdiProbe {
             irpost: 0,
             drpre: 0,
             drpost: 0,
-            irlen: 0
+            irlen: 0,
         };
-        for target in targets {
-            if target.idcode == idcode {
-                params.irlen = target.irlen;
+        for tap in taps {
+            if tap.idcode == idcode {
+                params.irlen = tap.irlen;
                 found = true;
             } else if found {
-                params.irpost += target.irlen;
+                params.irpost += tap.irlen;
                 params.drpost += 1;
             } else {
-                params.irpre += target.irlen;
+                params.irpre += tap.irlen;
                 params.drpre += 1;
             }
         }
@@ -288,22 +317,25 @@ impl FtdiProbe {
     fn get_chain_params(&self) -> io::Result<ChainParams> {
         match &self.chain_params {
             Some(params) => Ok(params.clone()),
-            None => {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "target is not selected"
-                ))
-            }
+            None => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "target is not selected",
+            )),
         }
     }
 
-    fn target_transfer(&mut self, address: u32, data: Option<&[u8]>, len_bits: usize) -> io::Result<Vec<u8>> {
+    fn target_transfer(
+        &mut self,
+        address: u32,
+        data: Option<&[u8]>,
+        len_bits: usize,
+    ) -> io::Result<Vec<u8>> {
         let params = self.get_chain_params()?;
         let max_address = (1 << params.irlen) - 1;
         if address > max_address {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid register address"
+                "invalid register address",
             ));
         }
 
@@ -329,7 +361,7 @@ impl FtdiProbe {
         } else {
             vec![0; (drbits + 7) / 8]
         };
-        let mut reply = self.transfer_dr(&request, drbits)?;
+        let reply = self.transfer_dr(&request, drbits)?;
 
         // Process the reply
         let mut reply = BitVec::<Lsb0, u8>::from_vec(reply);
@@ -354,12 +386,7 @@ impl FtdiProbe {
         Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
     }
 
-    fn write_register(
-        &mut self,
-        address: u32,
-        data: &[u8],
-        len: u32,
-    ) -> io::Result<Vec<u8>> {
+    fn write_register(&mut self, address: u32, data: &[u8], len: u32) -> io::Result<Vec<u8>> {
         self.target_transfer(address, Some(data), len as usize)
     }
 
@@ -383,6 +410,7 @@ fn main() {
             return;
         }
     };
+    probe.attach().unwrap();
 
     probe.reset().unwrap();
     probe.shift_ir(&[0x10], 5).unwrap();
