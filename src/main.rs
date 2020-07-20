@@ -2,6 +2,7 @@ use bitvec::order::Lsb0;
 use bitvec::vec::BitVec;
 use std::convert::TryInto;
 use std::io::{self, Read, Write};
+use std::sync::Mutex;
 use std::time::Duration;
 
 mod ftdi;
@@ -21,13 +22,13 @@ struct ChainParams {
     irlen: usize,
 }
 
-struct FtdiProbe {
+#[derive(Debug)]
+pub struct JtagAdapter {
     device: ftdi::Device,
     chain_params: Option<ChainParams>,
-    idle_cycles: u8,
 }
 
-impl FtdiProbe {
+impl JtagAdapter {
     pub fn open(vid: u16, pid: u16) -> Result<Self, ftdi::Error> {
         let mut builder = ftdi::Builder::new();
         builder.set_interface(ftdi::Interface::A)?;
@@ -36,7 +37,6 @@ impl FtdiProbe {
         Ok(Self {
             device,
             chain_params: None,
-            idle_cycles: 0,
         })
     }
 
@@ -370,14 +370,74 @@ impl FtdiProbe {
         reply.truncate(len_bits);
         let reply = reply.into_vec();
 
-        // Idle cycles
-        self.idle(self.idle_cycles as usize)?;
-
         Ok(reply)
     }
+}
 
+#[derive(Debug)]
+pub struct FtdiProbe {
+    adapter: Mutex<JtagAdapter>,
+    speed_khz: u32,
+    idle_cycles: u8,
+}
+
+impl FtdiProbe {
+    pub fn open(vid: u16, pid: u16) -> Result<Self, ftdi::Error> {
+        let adapter = JtagAdapter::open(vid, pid)?;
+        let probe = FtdiProbe {
+            adapter: Mutex::new(adapter),
+            speed_khz: 0,
+            idle_cycles: 0,
+        };
+        log::debug!("opened probe: {:?}", probe);
+        Ok(probe)
+    }
+
+    pub fn attach(&mut self) -> Result<(), ftdi::Error> {
+        log::debug!("attaching...");
+        let adapter = self.adapter.get_mut().unwrap();
+
+        adapter.attach()
+    }
+
+    pub fn test(&mut self) {
+        let adapter = self.adapter.get_mut().unwrap();
+
+        adapter.reset().unwrap();
+        adapter.shift_ir(&[0x10], 5).unwrap();
+        adapter.idle(42).unwrap();
+        //adapter.shift_ir(&[0x1f, 0x02], 10).unwrap();
+        adapter.select_target(0x1000563d).unwrap();
+    }
+}
+
+
+impl FtdiProbe {
     fn read_register(&mut self, address: u32, len: u32) -> io::Result<Vec<u8>> {
-        self.target_transfer(address, None, len as usize)
+        log::debug!("read_register({:#x}, {})", address, len);
+        let adapter = self.adapter.get_mut().unwrap();
+        let r = adapter
+            .target_transfer(address, None, len as usize)?;
+        adapter
+            .idle(self.idle_cycles as usize)?;
+        log::debug!("read_register result: {:?})", r);
+        Ok(r)
+    }
+
+    fn set_idle_cycles(&mut self, idle_cycles: u8) {
+        log::debug!("set_idle_cycles({})", idle_cycles);
+        self.idle_cycles = idle_cycles;
+    }
+
+    fn write_register(&mut self, address: u32, data: &[u8], len: u32) -> io::Result<Vec<u8>> {
+        log::debug!("write_register({:#x}, {:?}, {})", address, data, len);
+        let adapter = self.adapter.get_mut().unwrap();
+        let r = adapter
+            .target_transfer(address, Some(data), len as usize)?;
+        adapter
+            .idle(self.idle_cycles as usize)?;
+        log::debug!("write_register result: {:?})", r);
+        Ok(r)
     }
 
     fn read_register32(&mut self, address: u32) -> io::Result<u32> {
@@ -385,17 +445,9 @@ impl FtdiProbe {
         Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
     }
 
-    fn write_register(&mut self, address: u32, data: &[u8], len: u32) -> io::Result<Vec<u8>> {
-        self.target_transfer(address, Some(data), len as usize)
-    }
-
     fn write_register32(&mut self, address: u32, value: u32) -> io::Result<u32> {
         let r = self.write_register(address, &value.to_le_bytes(), 32)?;
         Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
-    }
-
-    fn set_idle_cycles(&mut self, idle_cycles: u8) {
-        self.idle_cycles = idle_cycles;
     }
 }
 
@@ -412,12 +464,8 @@ fn main() {
         }
     };
     probe.attach().unwrap();
+    probe.test();
 
-    probe.reset().unwrap();
-    probe.shift_ir(&[0x10], 5).unwrap();
-    probe.idle(42);
-    //probe.shift_ir(&[0x1f, 0x02], 10).unwrap();
-    probe.select_target(0x1000563d).unwrap();
     probe.set_idle_cycles(8);
 
     let r = probe.read_register32(0x01).unwrap();
